@@ -1,0 +1,14 @@
+aws_region    = "us-east-1"
+project_name  = "cicd-human-error-demo"
+environment   = "dev"
+instance_type = "t2.micro"
+volume_size   = 20
+key_name      = "github-actions-cicd-key"
+
+# Replace this with your public key content.
+# Generate one with: ssh-keygen -t rsa -b 4096 -f github-actions-cicd-key
+public_key = "ssh-rsa AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY"
+
+# Replace this with your public IP address plus /32.
+# Example: 76.100.55.44/32
+my_ip_cidr = "YOUR_PUBLIC_IP/32"
