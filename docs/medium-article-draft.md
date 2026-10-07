@@ -56,10 +56,31 @@ Tests + Security Scan + Docker Build
         ↓
 AWS EC2 Deployment Server
         ↓
-Docker Container on Port 8081
+Deploy to INACTIVE color (blue or green) on an internal port
         ↓
-User Accesses Application
+Staging validation directly against that internal port
+        ↓               \
+  validation passes       validation fails
+        ↓                       ↓
+Promote: flip nginx to    Stop here — production
+the new color, reload     never touched, workflow
+        ↓                 fails loudly
+Re-validate the real
+public endpoint (8081)
+        ↓               \
+   still healthy          check fails
+        ↓                       ↓
+   Done                   Automatic rollback:
+                           flip nginx back to the
+                           previous color, reload,
+                           fail the workflow
 ```
+
+This version replaced a simpler (and riskier) first version: stop the old
+container, start the new one, hope it's healthy. The original had **no
+rollback path at all** — once the new container was running, the old one
+was already gone, and if the new version failed to start cleanly, there
+was nothing to go back to.
 
 ## Tools Used
 
@@ -68,6 +89,8 @@ User Accesses Application
 - Terraform
 - AWS EC2
 - Ubuntu Linux
+- nginx (blue/green traffic router)
+- jq
 - Python Flask
 - Pytest
 - Trivy
@@ -75,9 +98,15 @@ User Accesses Application
 
 ## What the Pipeline Does
 
-Every push to the main branch triggers the GitHub Actions workflow. The workflow checks out the code, installs Python dependencies, runs tests, scans the application files, builds a Docker image, scans the image, copies the image to EC2, deploys the container, and validates the health endpoint.
+Every push to the main branch triggers the GitHub Actions workflow. The workflow checks out the code, installs Python dependencies, runs tests, scans the application files, builds a Docker image, scans the image, and copies it to EC2. From there, deployment is a blue/green swap: the new image goes to whichever color (blue or green) isn't currently serving traffic, gets validated directly on its own internal port, and only then gets promoted — a single nginx config swap and reload — to the public port. A second validation runs against the real public endpoint after promotion; if that fails, the pipeline automatically flips traffic back to the previous color and fails the run, rather than leaving a broken deployment live or reporting a false success.
 
-This creates a repeatable deployment process where every release follows the same path.
+This creates a repeatable deployment process where every release follows the same path, and a bad release is self-correcting instead of requiring someone to notice and fix it by hand.
+
+## Rollback: The Part the First Version Didn't Have
+
+The first version of this pipeline could deploy, but it couldn't recover. It stopped the running container, started the new one, and that was it — if the new version crashed on startup or failed its health check, there was no "old version" left to fall back to, because it had already been deleted.
+
+The fix was a single-host blue/green pattern: nginx sits in front of two internal ports, each running a container, and only one is "active" at any time via a symlinked config file. A new deploy always goes to the *inactive* side first, gets proven healthy on its own port with zero public exposure, and only then gets promoted by flipping that symlink. The previous version is never deleted until the *next* deploy overwrites it — so if promotion itself turns out to be bad (the public endpoint check fails after the swap), rolling back is just flipping the symlink again, not rebuilding anything.
 
 ## Business Value
 
@@ -90,6 +119,8 @@ This project provides several important business benefits:
 - Better application reliability
 - Stronger customer trust
 - Improved auditability
+- Automatic rollback on a failed deployment, with no manual intervention
+- Near-zero-downtime promotion (a config reload, not a container restart on the live port)
 
 ## Why This Matters for Cloud and DevOps Roles
 
@@ -99,8 +130,8 @@ It shows that I understand not only how to use tools, but why those tools matter
 
 ## Interview Explanation
 
-I automated deployment processes using GitHub Actions to eliminate manual deployment errors. The pipeline checks out code, installs dependencies, runs tests, scans for vulnerabilities, builds a Docker image, deploys it to an AWS EC2 server, and validates the health endpoint. This reduced operational risk, improved release consistency, and helped prevent wrong-version or skipped-validation deployments.
+I automated deployment processes using GitHub Actions to eliminate manual deployment errors. The pipeline checks out code, installs dependencies, runs tests, scans for vulnerabilities, builds a Docker image, and deploys it to an AWS EC2 server using a single-host blue/green pattern: the new version is validated on an internal port before it ever receives real traffic, promoted by an nginx config swap, re-validated against the public endpoint, and automatically rolled back to the previous version if that final check fails. This reduced operational risk, improved release consistency, prevented wrong-version or skipped-validation deployments, and — unlike the pipeline's first version — gave it an actual recovery path when a deployment goes wrong instead of just a way to notice afterward.
 
 ## Resume Bullet
 
-Built a GitHub Actions CI/CD pipeline that automated testing, security scanning, Docker image creation, and deployment to AWS EC2, reducing manual deployment errors and improving release reliability.
+Built a GitHub Actions CI/CD pipeline with staged validation, blue/green traffic promotion via nginx, and automated rollback on failed health checks — eliminating both manual deployment errors and the risk of a bad release staying live undetected.

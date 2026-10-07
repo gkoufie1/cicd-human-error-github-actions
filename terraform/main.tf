@@ -74,14 +74,49 @@ resource "aws_instance" "cicd_server" {
   key_name               = aws_key_pair.github_actions_key.key_name
   vpc_security_group_ids = [aws_security_group.cicd_sg.id]
 
+  # nginx is the blue/green router: it listens on the one public port
+  # (8081, matching the security group) and proxies to whichever internal
+  # port — 8091 (blue) or 8092 (green) — is currently marked active. The
+  # deploy workflow flips which upstream file is symlinked in and reloads
+  # nginx; it never touches the security group or this instance's own
+  # networking, so promotion is just a config swap, not new infra.
   user_data = <<-EOF_USERDATA
     #!/bin/bash
     set -eux
     apt-get update -y
-    apt-get install -y docker.io git curl ca-certificates
+    apt-get install -y docker.io git curl ca-certificates nginx jq
     systemctl enable docker
     systemctl start docker
     usermod -aG docker ubuntu
+
+    mkdir -p /etc/nginx/active /etc/nginx/upstreams
+    cat >/etc/nginx/upstreams/blue.conf <<-'EOF_BLUE'
+    set $backend "127.0.0.1:8091";
+    EOF_BLUE
+    cat >/etc/nginx/upstreams/green.conf <<-'EOF_GREEN'
+    set $backend "127.0.0.1:8092";
+    EOF_GREEN
+
+    # Starts pointed at blue; the deploy workflow's very first run deploys
+    # to green (the inactive color) and promotes from there, so this
+    # default never actually serves a real deployment on its own.
+    ln -sf /etc/nginx/upstreams/blue.conf /etc/nginx/active/current.conf
+
+    cat >/etc/nginx/sites-available/app <<-'EOF_SITE'
+    server {
+        listen 8081;
+        include /etc/nginx/active/current.conf;
+        location / {
+            proxy_pass http://$backend;
+            proxy_set_header Host $host;
+        }
+    }
+    EOF_SITE
+    ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
+    rm -f /etc/nginx/sites-enabled/default
+    systemctl enable nginx
+    systemctl restart nginx
+
     docker --version
   EOF_USERDATA
 

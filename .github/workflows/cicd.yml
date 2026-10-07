@@ -8,8 +8,10 @@ on:
 
 env:
   IMAGE_NAME: cicd-human-error-app
-  CONTAINER_NAME: cicd-human-error-container
+  # Public port is now owned by nginx (blue/green router on the EC2 host),
+  # not mapped directly to a container — see terraform/main.tf.
   APP_PORT: 8081
+  APP_SHA: ${{ github.sha }}
 
 jobs:
   test-scan-build-deploy:
@@ -68,25 +70,84 @@ jobs:
           source: app-image.tar
           target: /home/ubuntu
 
-      - name: Deploy Container on EC2
+      # Everything below is one remote script, not several steps, because
+      # the color decision (blue vs green) has to be made and acted on in
+      # the same shell that can see the current nginx symlink — splitting
+      # it across GitHub Actions steps would mean re-discovering that
+      # state over SSH more than once, with a race between the checks.
+      #
+      # The flow: load the new image, deploy it ONLY to whichever color
+      # isn't currently live, validate it directly on its internal port
+      # (production traffic untouched so far), promote by flipping the
+      # nginx symlink, re-validate against the real public port, and roll
+      # straight back to the previous color if that last check fails.
+      - name: Deploy (staging validate -> promote -> verify -> rollback)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_NAME,APP_SHA
           script: |
             set -e
-            docker load -i /home/ubuntu/app-image.tar
-            docker stop ${{ env.CONTAINER_NAME }} || true
-            docker rm ${{ env.CONTAINER_NAME }} || true
-            docker run -d \
-              --name ${{ env.CONTAINER_NAME }} \
-              --restart unless-stopped \
-              -p ${{ env.APP_PORT }}:5000 \
-              ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            docker ps
+            APP_VERSION=$(echo "$APP_SHA" | cut -c1-7)
 
-      - name: Validate Deployment
-        run: |
-          sleep 10
-          curl -f http://${{ secrets.EC2_HOST }}:${{ env.APP_PORT }}/health
+            docker load -i /home/ubuntu/app-image.tar
+
+            CURRENT_FILE=$(readlink /etc/nginx/active/current.conf)
+            CURRENT=$(basename "$CURRENT_FILE" .conf)
+            if [ "$CURRENT" = "blue" ]; then
+              NEW_COLOR=green; NEW_PORT=8092
+            else
+              NEW_COLOR=blue; NEW_PORT=8091
+            fi
+            echo "Live color: $CURRENT. Deploying $NEW_COLOR ($APP_VERSION) to port $NEW_PORT, production untouched so far."
+
+            docker stop app-$NEW_COLOR 2>/dev/null || true
+            docker rm app-$NEW_COLOR 2>/dev/null || true
+            docker run -d \
+              --name app-$NEW_COLOR \
+              --restart unless-stopped \
+              -p $NEW_PORT:5000 \
+              -e DEPLOY_COLOR=$NEW_COLOR \
+              -e APP_VERSION=$APP_VERSION \
+              $IMAGE_NAME:$APP_SHA
+
+            echo "Staging validation on internal port $NEW_PORT (not yet public)..."
+            STAGING_OK=""
+            for i in 1 2 3 4 5; do
+              if RESP=$(curl -sf http://127.0.0.1:$NEW_PORT/health); then STAGING_OK=1; break; fi
+              echo "  not ready yet (attempt $i/5)"; sleep 3
+            done
+            if [ -z "$STAGING_OK" ]; then
+              echo "STAGING VALIDATION FAILED: $NEW_COLOR never became healthy. Production ($CURRENT) was never touched."
+              exit 1
+            fi
+            GOT_COLOR=$(echo "$RESP" | jq -r .color)
+            if [ "$GOT_COLOR" != "$NEW_COLOR" ]; then
+              echo "STAGING VALIDATION FAILED: expected color '$NEW_COLOR', health endpoint reported '$GOT_COLOR'."
+              exit 1
+            fi
+            echo "Staging validation passed: $RESP"
+
+            echo "Promoting $NEW_COLOR to live traffic (nginx symlink swap + reload)..."
+            ln -sf /etc/nginx/upstreams/$NEW_COLOR.conf /etc/nginx/active/current.conf
+            sudo nginx -s reload
+            sleep 2
+
+            echo "Post-promotion validation against the real public endpoint..."
+            PUBLIC_OK=""
+            for i in 1 2 3; do
+              if PUB=$(curl -sf http://127.0.0.1:8081/health); then PUBLIC_OK=1; break; fi
+              sleep 2
+            done
+            PUB_COLOR=$(echo "$PUB" | jq -r .color 2>/dev/null || echo "")
+            if [ -n "$PUBLIC_OK" ] && [ "$PUB_COLOR" = "$NEW_COLOR" ]; then
+              echo "Promotion verified live: $PUB"
+            else
+              echo "POST-PROMOTION CHECK FAILED (got: '$PUB') — rolling back to $CURRENT automatically."
+              ln -sf /etc/nginx/upstreams/$CURRENT.conf /etc/nginx/active/current.conf
+              sudo nginx -s reload
+              echo "Rolled back: $CURRENT is live again. Failing this workflow run so it's visible, not silently green."
+              exit 1
+            fi

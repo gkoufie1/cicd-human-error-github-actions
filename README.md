@@ -20,8 +20,9 @@ Use GitHub Actions to automate the deployment process:
 4. Run security scans
 5. Build Docker image
 6. Copy image to EC2
-7. Deploy container
-8. Validate health endpoint
+7. Deploy to the inactive blue/green color and validate it on its own internal port
+8. Promote (nginx config swap) and re-validate against the real public endpoint
+9. Automatically roll back to the previous color if that last check fails
 
 ## Business Value
 
@@ -31,6 +32,8 @@ Use GitHub Actions to automate the deployment process:
 - Improved customer trust
 - Repeatable release process
 - Stronger audit trail
+- Automatic rollback on a failed deployment — no manual intervention required
+- Near-zero-downtime releases (a config reload, not a restart on the live port)
 
 ## Architecture
 
@@ -45,10 +48,16 @@ Tests + Security Scan + Docker Build
         ↓
 AWS EC2 Deployment Server
         ↓
-Docker Container on Port 8081
+Deploy + validate on the INACTIVE color (blue/green, internal port only)
+        ↓
+Promote: nginx swap to the new color  ──fails──▶  Automatic rollback to
+        ↓                                         the previous color
+Re-validate the public endpoint (8081)
         ↓
 Customer/User Browser
 ```
+
+See `terraform/README.md` for how the blue/green router actually works.
 
 ## Folder Structure
 
@@ -108,9 +117,11 @@ curl http://EC2_PUBLIC_IP:8081/health
 Expected response:
 
 ```json
-{"status":"healthy","version":"1.3"}
+{"status":"healthy","version":"a1b2c3d","color":"green"}
 ```
+
+`color` reflects whichever side (blue or green) is currently live, and `version` is the deployed commit's short SHA — both set by the deploy workflow, so a response always proves which release actually answered it.
 
 ## Interview Answer
 
-I automated deployment processes using GitHub Actions to eliminate manual deployment errors. The pipeline checks out code, installs dependencies, runs tests, scans for vulnerabilities, builds a Docker image, deploys it to an AWS EC2 server, and validates the health endpoint. This reduced operational risk, improved release consistency, and helped prevent wrong-version or skipped-validation deployments.
+I automated deployment processes using GitHub Actions to eliminate manual deployment errors. The pipeline checks out code, installs dependencies, runs tests, scans for vulnerabilities, builds a Docker image, and deploys it to an AWS EC2 server using a single-host blue/green pattern: the new version is validated on an internal port before it receives any real traffic, promoted via an nginx config swap, re-validated against the public endpoint, and automatically rolled back to the previous version if that final check fails. This reduced operational risk, improved release consistency, prevented wrong-version or skipped-validation deployments, and gave the pipeline an actual recovery path instead of just a way to notice a bad release after the fact.
